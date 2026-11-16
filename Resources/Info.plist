@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key><string>Blanko</string>
+	<key>CFBundleDisplayName</key><string>Blanko</string>
+	<key>CFBundleIdentifier</key><string>com.koreluyar.blanko</string>
+	<key>CFBundleExecutable</key><string>Blanko</string>
+	<key>CFBundleIconFile</key><string>AppIcon</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>CFBundleShortVersionString</key><string>__VERSION__</string>
+	<key>CFBundleVersion</key><string>__BUILD__</string>
+	<key>LSMinimumSystemVersion</key><string>14.0</string>
+	<key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
+	<key>NSHighResolutionCapable</key><true/>
+	<key>NSPrincipalClass</key><string>NSApplication</string>
+	<key>CFBundleDevelopmentRegion</key><string>en</string>
+	<key>NSDocumentsFolderUsageDescription</key><string>Blanko shows the PDFs in your Documents folder and saves what you fill in.</string>
+	<key>NSDownloadsFolderUsageDescription</key><string>Blanko shows the PDFs in your Downloads folder and saves what you fill in.</string>
+	<key>NSDesktopFolderUsageDescription</key><string>Blanko shows the PDFs on your Desktop and saves what you fill in.</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key><string>PDF</string>
+			<key>CFBundleTypeRole</key><string>Editor</string>
+			<key>LSHandlerRank</key><string>Alternate</string>
+			<key>LSItemContentTypes</key><array><string>com.adobe.pdf</string></array>
+		</dict>
+	</array>
+</dict>
+</plist>
