@@ -96,9 +96,11 @@ final class AppState: ObservableObject {
 
     func save() {
         guard let reader else { return }
-        if !reader.save() {
-            alert(L("The PDF could not be saved.", "Das PDF liess sich nicht sichern."),
-                  L("Try \"Save a Copy…\" to write it somewhere else.", "Versuch «Kopie sichern…», um es woanders abzulegen."))
+        reader.saveInBackground { [weak self] ok in
+            if !ok {
+                self?.alert(L("The PDF could not be saved.", "Das PDF liess sich nicht sichern."),
+                            L("Try \"Save a Copy…\" to write it somewhere else.", "Versuch «Kopie sichern…», um es woanders abzulegen."))
+            }
         }
     }
 
@@ -115,7 +117,7 @@ final class AppState: ObservableObject {
 
     /// Asks what to do with unsaved answers. Returns false when the person cancels.
     func confirmLeaving() -> Bool {
-        guard let reader, reader.dirty else { return true }
+        guard let reader, reader.dirty, !reader.saving else { return true }
         let a = NSAlert()
         a.messageText = L("Save the changes to \"\(reader.name)\"?", "Änderungen an «\(reader.name)» sichern?")
         a.informativeText = L("Otherwise what was filled in is lost.", "Sonst geht das Ausgefüllte verloren.")

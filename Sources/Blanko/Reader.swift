@@ -10,6 +10,7 @@ struct ReaderView: View {
         HStack(spacing: 0) {
             PDFCanvas(model: model)
                 .frame(minWidth: 380)
+                .allowsHitTesting(!model.saving)
             if showChat {
                 Divider()
                 ChatPanel(model: model)
@@ -45,7 +46,7 @@ struct ReaderView: View {
                 }
 
                 Button { app.save() } label: { Label(L("Save", "Sichern"), systemImage: "square.and.arrow.down") }
-                    .disabled(!model.dirty)
+                    .disabled(!model.dirty || model.saving)
                     .help(L("Save the answers into the PDF (⌘S)", "Antworten ins PDF sichern (⌘S)"))
 
                 Button { withAnimation(.easeOut(duration: 0.18)) { showChat.toggle() } } label: {
@@ -59,6 +60,7 @@ struct ReaderView: View {
     private var subtitle: String {
         let page = L("Page \(model.pageIndex + 1) of \(model.document.pageCount)",
                      "Seite \(model.pageIndex + 1) von \(model.document.pageCount)")
+        if model.saving { return page + " · " + L("saving…", "sichert…") }
         return model.dirty ? page + " · " + L("not saved", "nicht gesichert") : page
     }
 

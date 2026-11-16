@@ -29,6 +29,8 @@ final class ReaderModel: ObservableObject {
     @Published var status = ""
     @Published var undoable: Set<UUID> = []
     @Published var hasSelection = false
+    @Published var saving = false
+    @Published var savingSince = Date()
 
     weak var canvas: CanvasView?
     private var changes: [UUID: [Change]] = [:]
@@ -178,6 +180,32 @@ final class ReaderModel: ObservableObject {
         } catch {
             try? FileManager.default.removeItem(at: temp)
             return false
+        }
+    }
+
+    /// Saves without holding up the window: the writing happens off the main thread, the page is
+    /// locked against edits meanwhile.
+    func saveInBackground(_ done: @escaping (Bool) -> Void) {
+        guard !saving else { return }
+        canvas?.commitEditing()
+        canvas?.window?.makeFirstResponder(canvas)
+        saving = true
+        savingSince = Date()
+        dirty = false
+        let document = self.document, url = self.url
+        DispatchQueue.global(qos: .userInitiated).async {
+            let temp = url.deletingLastPathComponent().appendingPathComponent(".\(UUID().uuidString).pdf")
+            var ok = document.write(to: temp)
+            if ok {
+                ok = (try? FileManager.default.replaceItemAt(url, withItemAt: temp)) != nil
+            }
+            if !ok { try? FileManager.default.removeItem(at: temp) }
+            let result = ok
+            DispatchQueue.main.async {
+                self.saving = false
+                if !result { self.dirty = true }
+                done(result)
+            }
         }
     }
 
