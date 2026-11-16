@@ -138,14 +138,63 @@ struct AnthropicBackend: AIBackend {
 struct ClaudeCodeBackend: AIBackend {
     let executable: String
 
+    /// The environment of the person's own terminal. An app started from the Dock gets none of
+    /// what the shell profile sets (PATH, CLAUDE_CONFIG_DIR, tokens), and Claude Code then looks
+    /// in the wrong place for its login.
+    static let shellEnvironment: [String: String] = {
+        var env = ProcessInfo.processInfo.environment
+        // Claude Code finds its keychain entry by user name.
+        if env["USER"] == nil { env["USER"] = NSUserName() }
+        if env["HOME"] == nil { env["HOME"] = NSHomeDirectory() }
+        let shell = env["SHELL"].flatMap { FileManager.default.isExecutableFile(atPath: $0) ? $0 : nil } ?? "/bin/zsh"
+        let marker = "__BLANKO_ENV__"
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: shell)
+        process.arguments = ["-ilc", "printf '\(marker)'; command env -0"]
+        process.standardInput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        process.environment = env
+        let out = Pipe()
+        process.standardOutput = out
+        guard (try? process.run()) != nil else { return env }
+        let killer = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 8, execute: killer)
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        killer.cancel()
+        guard let text = String(data: data, encoding: .utf8), let range = text.range(of: marker) else { return env }
+        for entry in text[range.upperBound...].split(separator: "\0") {
+            guard let eq = entry.firstIndex(of: "=") else { continue }
+            env[String(entry[..<eq])] = String(entry[entry.index(after: eq)...])
+        }
+        return env
+    }()
+
     static func locate() -> String? {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let candidates = ["\(home)/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude",
-                          "\(home)/.claude/local/claude", "\(home)/.npm-global/bin/claude"]
+        // The same `claude` the terminal would start, then the usual install places.
+        var candidates = (shellEnvironment["PATH"] ?? "").split(separator: ":").map { "\($0)/claude" }
+        candidates += ["\(home)/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude",
+                       "\(home)/.claude/local/claude", "\(home)/.npm-global/bin/claude"]
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     func run(_ request: AIRequest) async throws -> [String: Any] {
+        do {
+            return try await run(request, settingSources: "")
+        } catch AIError.failed(let message) where message.lowercased().contains("not logged in") {
+            // The login may come from the person's own settings (an API key helper, for example).
+            do {
+                return try await run(request, settingSources: "user")
+            } catch AIError.failed(let second) where second.lowercased().contains("not logged in") {
+                throw AIError.failed(L(
+                    "Claude Code on this Mac is not signed in. Open Terminal, run \"claude\", type /login there and finish the sign-in. Then ask again here. (Or add an Anthropic API key in Settings, ⌘,)",
+                    "Claude Code ist auf diesem Mac nicht angemeldet. Öffne das Terminal, starte «claude», tippe dort /login und schliess die Anmeldung ab. Dann frag hier nochmal. (Oder trag in den Einstellungen, ⌘, einen Anthropic-API-Key ein.)"))
+            }
+        }
+    }
+
+    private func run(_ request: AIRequest, settingSources: String) async throws -> [String: Any] {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("blanko-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -171,13 +220,12 @@ struct ClaudeCodeBackend: AIBackend {
             "-p", "--output-format", "json", "--json-schema", schema,
             "--model", request.model, "--effort", "high",
             "--system-prompt", request.system,
-            "--tools", "Read", "--setting-sources", "", "--strict-mcp-config",
+            "--tools", "Read", "--setting-sources", settingSources, "--strict-mcp-config",
             "--no-session-persistence", "--disable-slash-commands",
         ]
-        var env = ProcessInfo.processInfo.environment
+        var env = Self.shellEnvironment
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        env["PATH"] = "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
-        env.removeValue(forKey: "ANTHROPIC_API_KEY")
+        env["PATH"] = (env["PATH"] ?? "") + ":\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
         process.environment = env
 
         let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
