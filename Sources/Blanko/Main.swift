@@ -6,6 +6,10 @@ import UniformTypeIdentifiers
 enum Entry {
     static func main() {
         let args = CommandLine.arguments
+        // Blanko has no window state worth restoring; this also keeps macOS from asking
+        // "reopen windows?" after a crash.
+        UserDefaults.standard.set(true, forKey: "ApplePersistenceIgnoreState")
+        ClaudeCodeBackend.prepare()
         if CLI.handle(args) { return }
         // Launch options for testing: --library-dir <dir>, --open <pdf>, --ask "<message>"
         if let i = args.firstIndex(of: "--library-dir"), i + 1 < args.count {

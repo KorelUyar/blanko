@@ -41,6 +41,11 @@ next to it in the code (`L("English", "Deutsch")`), chosen inside the app.
   clicks in `hitTest` and handles form fields itself.
 - **Spotlight hides Desktop / Documents / Downloads from an app** until macOS has asked the
   person; it never asks by itself. Walking those folders directly triggers the question.
+- **Never wait for a child process on the main thread** (`waitUntilExit` spins the run loop,
+  SwiftUI re-enters the view body and the app dies in `dispatch_once`). 0.1.1 crashed on opening
+  any PDF this way. The shell environment is read in the background at launch.
+- **Test a release in the window before publishing it** (`open -n /Applications/Blanko.app --args
+  --library-dir … --open … --uitest "ask …"`), not only with `--solve`.
 - Build with `--build-system native` (see `scripts/build-app.sh`), otherwise the binary is stamped
   as a macOS 14 app once Xcode is installed.
 

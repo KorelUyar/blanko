@@ -56,6 +56,7 @@ enum CLI {
                 }
                 i += 1
             }
+            _ = await ClaudeCodeBackend.readyEnvironment()
             let backend = try AI.backend()
             for p in pages {
                 let start = Date()

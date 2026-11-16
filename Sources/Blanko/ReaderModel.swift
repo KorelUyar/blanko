@@ -57,6 +57,7 @@ final class ReaderModel: ObservableObject {
         task = Task { [weak self] in
             guard let self else { return }
             do {
+                _ = await ClaudeCodeBackend.readyEnvironment()
                 let backend = try AI.backend()
                 let model = Prefs.shared.aiModel
                 let check = Prefs.shared.doubleCheck

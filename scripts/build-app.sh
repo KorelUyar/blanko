@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VERSION="0.1.1"
+VERSION="0.1.2"
 BUILD="$(date +%Y%m%d%H%M)"
 # The classic build system, by name: with Xcode on the Mac, SwiftPM's newer one stamps the binary
 # with the SDK of the deployment target, and AppKit then treats the app like a macOS 14 app.

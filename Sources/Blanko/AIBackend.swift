@@ -141,11 +141,45 @@ struct ClaudeCodeBackend: AIBackend {
     /// The environment of the person's own terminal. An app started from the Dock gets none of
     /// what the shell profile sets (PATH, CLAUDE_CONFIG_DIR, tokens), and Claude Code then looks
     /// in the wrong place for its login.
-    static let shellEnvironment: [String: String] = {
+    /// Read once in the background at launch (`prepare`). Never read it on the main thread:
+    /// waiting for the shell there re-enters the interface and crashes it.
+    private static let lock = NSLock()
+    private static var loaded: [String: String]?
+
+    private static var baseEnvironment: [String: String] {
         var env = ProcessInfo.processInfo.environment
         // Claude Code finds its keychain entry by user name.
         if env["USER"] == nil { env["USER"] = NSUserName() }
         if env["HOME"] == nil { env["HOME"] = NSHomeDirectory() }
+        return env
+    }
+
+    /// What is known right now; does not wait.
+    static var shellEnvironment: [String: String] {
+        lock.lock(); defer { lock.unlock() }
+        return loaded ?? baseEnvironment
+    }
+
+    static func prepare() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let env = readShellEnvironment()
+            lock.lock(); loaded = env; lock.unlock()
+            DispatchQueue.main.async { Prefs.shared.objectWillChange.send() }
+        }
+    }
+
+    /// Waits (off the main thread's back) until the shell has answered, at most ten seconds.
+    static func readyEnvironment() async -> [String: String] {
+        for _ in 0..<100 {
+            lock.lock(); let env = loaded; lock.unlock()
+            if let env { return env }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return baseEnvironment
+    }
+
+    private static func readShellEnvironment() -> [String: String] {
+        var env = baseEnvironment
         let shell = env["SHELL"].flatMap { FileManager.default.isExecutableFile(atPath: $0) ? $0 : nil } ?? "/bin/zsh"
         let marker = "__BLANKO_ENV__"
         let process = Process()
@@ -168,7 +202,7 @@ struct ClaudeCodeBackend: AIBackend {
             env[String(entry[..<eq])] = String(entry[entry.index(after: eq)...])
         }
         return env
-    }()
+    }
 
     static func locate() -> String? {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -223,7 +257,7 @@ struct ClaudeCodeBackend: AIBackend {
             "--tools", "Read", "--setting-sources", settingSources, "--strict-mcp-config",
             "--no-session-persistence", "--disable-slash-commands",
         ]
-        var env = Self.shellEnvironment
+        var env = await Self.readyEnvironment()
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         env["PATH"] = (env["PATH"] ?? "") + ":\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
         process.environment = env
