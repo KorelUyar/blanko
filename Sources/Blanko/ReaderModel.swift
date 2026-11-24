@@ -12,6 +12,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     var text: String
     var page: Int?              // page the assistant worked on (0-based)
     var summary: String?        // what was changed on the page
+    var fix: String?            // error only: which way out to offer: "cli" (sign in again), "api" (the key), "none" (no source)
 }
 
 /// One open PDF: the document, the tool state and its chat.
@@ -32,9 +33,13 @@ final class ReaderModel: ObservableObject {
     @Published var saving = false
     @Published var savingSince = Date()
 
+    /// The sheet for entering an Anthropic API key, opened from an error in the chat.
+    @Published var showKeySheet = false
+
     weak var canvas: CanvasView?
     private var changes: [UUID: [Change]] = [:]
     private var task: Task<Void, Never>?
+    private var lastRequest: (text: String, wholeDocument: Bool, page: Int)?
 
     var name: String { url.lastPathComponent }
 
@@ -47,15 +52,16 @@ final class ReaderModel: ObservableObject {
 
     // MARK: Chat
 
-    func send(_ text: String, wholeDocument: Bool = false) {
+    func send(_ text: String, wholeDocument: Bool = false, page: Int? = nil) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !busy else { return }
         canvas?.commitEditing()
         let history = historyText()
         messages.append(ChatMessage(role: "user", text: trimmed))
         busy = true
+        lastRequest = (trimmed, wholeDocument, page ?? pageIndex)
 
-        let pages = wholeDocument ? Array(0..<document.pageCount) : [pageIndex]
+        let pages = wholeDocument ? Array(0..<document.pageCount) : [lastRequest!.page]
         task = Task { [weak self] in
             guard let self else { return }
             do {
@@ -96,10 +102,10 @@ final class ReaderModel: ObservableObject {
                     }
                 }
                 if let firstError, !Task.isCancelled {
-                    self.messages.append(ChatMessage(role: "error", text: firstError.localizedDescription))
+                    self.messages.append(Self.errorMessage(firstError))
                 }
             } catch {
-                self.messages.append(ChatMessage(role: "error", text: error.localizedDescription))
+                self.messages.append(Self.errorMessage(error))
             }
             self.busy = false
             self.status = ""
@@ -111,6 +117,30 @@ final class ReaderModel: ObservableObject {
         task?.cancel()
         busy = false
         status = ""
+    }
+
+    /// An error for the chat, with the way out the buttons under it offer.
+    private static func errorMessage(_ error: Error) -> ChatMessage {
+        var message = ChatMessage(role: "error", text: error.localizedDescription)
+        switch error {
+        case AIError.access(_, let source): message.fix = source
+        case AIError.noSource: message.fix = "none"
+        default: break
+        }
+        return message
+    }
+
+    /// Sends the last request again, in place of the error it ended with.
+    func retry() {
+        guard !busy else { return }
+        let request = lastRequest
+            ?? messages.last(where: { $0.role == "user" }).map { ($0.text, false, pageIndex) }
+        guard let request else { return }
+        // Drop the failed attempt: the error and the question it answered.
+        while let last = messages.last, last.role == "error" { messages.removeLast() }
+        if let last = messages.last, last.role == "user", last.text == request.text { messages.removeLast() }
+        if !request.wholeDocument, let page = document.page(at: request.page) { canvas?.go(to: page) }
+        send(request.text, wholeDocument: request.wholeDocument, page: request.page)
     }
 
     private func statusText(done: Int, of total: Int, page: Int) -> String {

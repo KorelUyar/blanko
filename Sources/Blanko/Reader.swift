@@ -20,6 +20,9 @@ struct ReaderView: View {
         }
         .navigationTitle(model.name)
         .navigationSubtitle(subtitle)
+        .sheet(isPresented: $model.showKeySheet) {
+            APIKeySheet { model.retry() }
+        }
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 Button { app.closeReader() } label: { Label(L("Library", "Bibliothek"), systemImage: "chevron.left") }
@@ -112,10 +115,12 @@ struct ChatPanel: View {
             }
             .padding(.top, 4)
             if AI.resolvedSource() == nil {
-                Label(L("No AI source yet. Open Settings (⌘,) to add one.",
-                        "Noch keine KI-Quelle. Öffne die Einstellungen (⌘,), um eine einzurichten."),
+                Label(L("No AI source yet: use an Anthropic API key, or install Claude Code and sign in.",
+                        "Noch keine KI-Quelle: Verwende einen Anthropic-API-Key oder installiere Claude Code und melde dich an."),
                       systemImage: "exclamationmark.triangle")
                     .font(.callout).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button(L("Use an API key…", "API-Key verwenden…")) { model.showKeySheet = true }
             }
             Spacer()
         }
@@ -221,6 +226,74 @@ struct ChatPanel: View {
     }
 }
 
+/// The ways out under an error: sign in to Claude Code again, use an API key, try again.
+private struct ErrorActions: View {
+    let fix: String?
+    @ObservedObject var model: ReaderModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if fix == "cli" && ClaudeCodeBackend.locate() != nil {
+                Button(L("Sign in again", "Neu anmelden")) { ClaudeCodeBackend.openSignIn() }
+                    .help(L("Opens Terminal with the Claude sign-in. Come back here when it is done.",
+                            "Öffnet das Terminal mit der Claude-Anmeldung. Danach hier weitermachen."))
+            }
+            if fix != nil {
+                Button(fix == "api" ? L("Change API key…", "API-Key ändern…") : L("Use an API key…", "API-Key verwenden…")) {
+                    model.showKeySheet = true
+                }
+            }
+            Button(L("Try again", "Nochmal")) { model.retry() }
+        }
+        .controlSize(.small)
+    }
+}
+
+/// Entering an Anthropic API key, from the chat. Saved in the keychain, sent only to Anthropic.
+struct APIKeySheet: View {
+    var onSaved: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var key = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(L("Use an Anthropic API key", "Anthropic-API-Key verwenden")).font(.title3.weight(.semibold))
+            Text(L("With a key of your own, the assistant runs directly through Anthropic's API, without Claude Code and its sign-in. Each request is billed to your Anthropic account.",
+                   "Mit einem eigenen Key läuft der Assistent direkt über die API von Anthropic, ohne Claude Code und dessen Anmeldung. Jede Anfrage wird deinem Anthropic-Konto verrechnet."))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Link(L("Create a key at console.anthropic.com", "Key auf console.anthropic.com erstellen"),
+                 destination: URL(string: "https://console.anthropic.com/settings/keys")!)
+            SecureField("sk-ant-…", text: $key)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(save)
+            Text(L("Stored in this Mac's keychain. Blanko sends it only to api.anthropic.com. If Claude Code works as well, the key comes first and Claude Code stands by.",
+                   "Wird im Schlüsselbund dieses Macs gesichert. Blanko schickt ihn nur an api.anthropic.com. Funktioniert auch Claude Code, kommt der Key zuerst und Claude Code springt ein."))
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button(L("Cancel", "Abbrechen")) { dismiss() }.keyboardShortcut(.cancelAction)
+                Button(L("Save and try again", "Sichern und nochmal")) { save() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(22)
+        .frame(width: 440)
+    }
+
+    private func save() {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        Keychain.setAPIKey(trimmed)
+        // "Automatic" takes the key first; a source set to Claude Code alone would ignore it.
+        Prefs.shared.aiSource = "auto"
+        dismiss()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { onSaved() }
+    }
+}
+
 private struct MessageRow: View {
     let message: ChatMessage
     @ObservedObject var model: ReaderModel
@@ -236,9 +309,15 @@ private struct MessageRow: View {
                     .background(Ink.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 11))
             }
         case "error":
-            Label(message.text, systemImage: "exclamationmark.triangle")
-                .font(.callout).foregroundStyle(.red)
-                .textSelection(.enabled)
+            VStack(alignment: .leading, spacing: 9) {
+                Label(message.text, systemImage: "exclamationmark.triangle")
+                    .font(.callout).foregroundStyle(.red)
+                    .textSelection(.enabled)
+                if model.messages.last?.id == message.id && !model.busy {
+                    ErrorActions(fix: message.fix, model: model)
+                        .padding(.leading, 26)
+                }
+            }
         default:
             VStack(alignment: .leading, spacing: 7) {
                 Text(rendered).textSelection(.enabled).lineSpacing(2)

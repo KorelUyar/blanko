@@ -188,6 +188,8 @@ struct SettingsView: View {
     @EnvironmentObject var prefs: Prefs
     @State private var key = ""
     @State private var hasKey = Keychain.apiKey() != nil
+    @State private var login: (loggedIn: Bool, expires: Date?)?
+    @State private var checked = false
 
     var body: some View {
         Form {
@@ -197,18 +199,22 @@ struct SettingsView: View {
                     Text("Deutsch").tag("de")
                 }
             }
-            Section(L("Assistant", "Assistent")) {
+            Section {
                 Picker(L("Runs through", "Läuft über"), selection: $prefs.aiSource) {
                     Text(L("Automatic", "Automatisch")).tag("auto")
                     Text("Claude Code").tag("cli")
                     Text(L("Anthropic API key", "Anthropic-API-Key")).tag("api")
                 }
                 LabeledContent("Claude Code") {
-                    Text(ClaudeCodeBackend.locate() != nil
-                         ? L("Found. Uses your Claude login, no key needed.", "Gefunden. Nutzt dein Claude-Login, kein Key nötig.")
-                         : L("Not installed on this Mac.", "Auf diesem Mac nicht installiert."))
-                        .foregroundStyle(.secondary)
+                    HStack {
+                        Text(claudeCodeState).foregroundStyle(.secondary)
+                        if ClaudeCodeBackend.locate() != nil {
+                            Button(L("Sign in again", "Neu anmelden")) { ClaudeCodeBackend.openSignIn() }
+                                .help(L("Opens Terminal with the Claude sign-in", "Öffnet das Terminal mit der Claude-Anmeldung"))
+                        }
+                    }
                 }
+                .task { login = await ClaudeCodeBackend.authStatus(); checked = true }
                 LabeledContent(L("API key", "API-Key")) {
                     HStack {
                         SecureField(hasKey ? L("Saved in the keychain", "Im Schlüsselbund gesichert") : "sk-ant-…", text: $key)
@@ -234,11 +240,31 @@ struct SettingsView: View {
                 }
                 Toggle(L("Check the placement after writing (slower, tidier)",
                          "Platzierung nach dem Schreiben prüfen (langsamer, sauberer)"), isOn: $prefs.doubleCheck)
+            } header: {
+                Text(L("Assistant", "Assistent"))
+            } footer: {
+                Text(L("Automatic takes the API key when one is saved, otherwise Claude Code. Whichever is chosen, when it cannot sign in, the other one answers instead, if it is set up.",
+                       "Automatisch nimmt den API-Key, wenn einer gesichert ist, sonst Claude Code. Kann sich die gewählte Quelle nicht anmelden, antwortet die andere, falls sie eingerichtet ist."))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .formStyle(.grouped)
         .frame(width: 560)
         .fixedSize(horizontal: false, vertical: true)
         .id(prefs.lang)
+    }
+
+    private var claudeCodeState: String {
+        guard ClaudeCodeBackend.locate() != nil else { return L("Not installed on this Mac.", "Auf diesem Mac nicht installiert.") }
+        guard checked else { return L("Checking the sign-in…", "Prüfe die Anmeldung…") }
+        guard let login else { return L("Found. Uses your Claude login.", "Gefunden. Nutzt dein Claude-Login.") }
+        guard login.loggedIn else { return L("Not signed in.", "Nicht angemeldet.") }
+        if let expires = login.expires {
+            if expires < Date() { return L("Sign-in expired.", "Anmeldung abgelaufen.") }
+            let date = expires.formatted(date: .abbreviated, time: .omitted)
+            return L("Signed in, until \(date).", "Angemeldet, bis \(date).")
+        }
+        return L("Signed in.", "Angemeldet.")
     }
 }

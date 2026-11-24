@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 import Security
 
 struct AIRequest {
@@ -12,15 +12,19 @@ struct AIRequest {
 enum AIError: LocalizedError {
     case noSource
     case failed(String)
+    /// The source could not be used at all: Claude Code is signed out or its login could not be
+    /// renewed, or the API key was refused or has no credit left. `source` is "cli" or "api".
+    case access(String, source: String)
     case refused
     case badOutput
 
     var errorDescription: String? {
         switch self {
         case .noSource:
-            return L("No AI source is set up. Add an Anthropic API key in Settings, or install Claude Code and sign in.",
-                     "Keine KI-Quelle eingerichtet. Trage in den Einstellungen einen Anthropic-API-Key ein oder installiere Claude Code und melde dich an.")
+            return L("No AI source is set up yet. Use an Anthropic API key, or install Claude Code and sign in.",
+                     "Noch keine KI-Quelle eingerichtet. Verwende einen Anthropic-API-Key oder installiere Claude Code und melde dich an.")
         case .failed(let m): return m
+        case .access(let m, _): return m
         case .refused:
             return L("The model declined this request.", "Das Modell hat diese Anfrage abgelehnt.")
         case .badOutput:
@@ -46,11 +50,51 @@ enum AI {
         }
     }
 
+    /// The chosen source, with the other one (when there is one) standing by: if the first cannot
+    /// sign in, the request goes to the second instead of failing.
     static func backend() throws -> AIBackend {
+        let api: AIBackend? = Keychain.apiKey().map { AnthropicBackend(apiKey: $0) }
+        let cli: AIBackend? = ClaudeCodeBackend.locate().map { ClaudeCodeBackend(executable: $0) }
         switch resolvedSource() {
-        case "api": return AnthropicBackend(apiKey: Keychain.apiKey() ?? "")
-        case "cli": return ClaudeCodeBackend(executable: ClaudeCodeBackend.locate() ?? "")
+        case "api": return FallbackBackend(primary: api!, alternate: cli)
+        case "cli": return FallbackBackend(primary: cli!, alternate: api)
         default: throw AIError.noSource
+        }
+    }
+}
+
+/// Runs `primary`; when it cannot be used at all (signed out, key refused), runs `alternate`.
+/// After one such failure the rest of this request (other pages, the placement check) goes
+/// straight to the alternate.
+final class FallbackBackend: AIBackend, @unchecked Sendable {
+    let primary: AIBackend
+    let alternate: AIBackend?
+    private let lock = NSLock()
+    private var primaryDown = false
+
+    init(primary: AIBackend, alternate: AIBackend?) {
+        self.primary = primary
+        self.alternate = alternate
+    }
+
+    private var skipPrimary: Bool {
+        get { lock.withLock { primaryDown } }
+        set { lock.withLock { primaryDown = newValue } }
+    }
+
+    func run(_ request: AIRequest) async throws -> [String: Any] {
+        if skipPrimary, let alternate { return try await alternate.run(request) }
+        do {
+            return try await primary.run(request)
+        } catch AIError.access(let message, let source) {
+            guard let alternate else { throw AIError.access(message, source: source) }
+            skipPrimary = true
+            do {
+                return try await alternate.run(request)
+            } catch AIError.access {
+                // Neither works: report the first one, that is the one the person chose.
+                throw AIError.access(message, source: source)
+            }
         }
     }
 }
@@ -110,9 +154,13 @@ struct AnthropicBackend: AIBackend {
                 try await Task.sleep(nanoseconds: UInt64(min(wait, 30) * 1_000_000_000))
                 continue
             }
-            if status == 401 {
-                throw AIError.failed(L("The API key was not accepted. Check it in Settings.",
-                                       "Der API-Key wurde nicht akzeptiert. Prüfe ihn in den Einstellungen."))
+            if status == 401 || status == 403 {
+                throw AIError.access(L("The API key was not accepted (\(message)).",
+                                       "Der API-Key wurde nicht akzeptiert (\(message))."), source: "api")
+            }
+            if status == 400 && message.lowercased().contains("credit") {
+                throw AIError.access(L("The API key has no credit left (\(message)).",
+                                       "Auf dem API-Key ist kein Guthaben mehr (\(message))."), source: "api")
             }
             throw AIError.failed("Anthropic API: \(message)")
         }
@@ -207,54 +255,123 @@ struct ClaudeCodeBackend: AIBackend {
     static func locate() -> String? {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         // The same `claude` the terminal would start, then the usual install places.
-        var candidates = (shellEnvironment["PATH"] ?? "").split(separator: ":").map { "\($0)/claude" }
+        // Absolute folders only: a "." or empty PATH entry would point wherever the app happens to run.
+        var candidates = (shellEnvironment["PATH"] ?? "").split(separator: ":").filter { $0.hasPrefix("/") }.map { "\($0)/claude" }
         candidates += ["\(home)/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude",
                        "\(home)/.claude/local/claude", "\(home)/.npm-global/bin/claude"]
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
+    /// Whether Claude Code's answer means it could not sign in (as opposed to any other failure).
+    static func isSignInProblem(_ message: String) -> Bool {
+        let m = message.lowercased()
+        return ["not logged in", "failed to authenticate", "authentication", "oauth", "/login", "log in",
+                "invalid api key", "unauthorized", "401"].contains { m.contains($0) }
+    }
+
     func run(_ request: AIRequest) async throws -> [String: Any] {
-        do {
-            return try await run(request, settingSources: "")
-        } catch AIError.failed(let message) where message.lowercased().contains("not logged in") {
-            // The login may come from the person's own settings (an API key helper, for example).
+        // 1. As set up. 2. Once more after a moment: the login is renewed by whichever Claude Code
+        // on this Mac runs first after it expires, and a fresh process reads the renewed one; two
+        // renewing at the same moment is what makes "could not be refreshed" come and go.
+        // 3. With the person's own Claude Code settings, where the login may come from (a key helper).
+        var last = ""
+        for (attempt, sources) in [(0, ""), (1, ""), (2, "user")] {
             do {
-                return try await run(request, settingSources: "user")
-            } catch AIError.failed(let second) where second.lowercased().contains("not logged in") {
-                throw AIError.failed(L(
-                    "Claude Code on this Mac is not signed in. Open Terminal, run \"claude\", type /login there and finish the sign-in. Then ask again here. (Or add an Anthropic API key in Settings, ⌘,)",
-                    "Claude Code ist auf diesem Mac nicht angemeldet. Öffne das Terminal, starte «claude», tippe dort /login und schliess die Anmeldung ab. Dann frag hier nochmal. (Oder trag in den Einstellungen, ⌘, einen Anthropic-API-Key ein.)"))
+                return try await run(request, settingSources: sources)
+            } catch AIError.failed(let message) where Self.isSignInProblem(message) {
+                last = message.hasPrefix("Claude Code: ") ? String(message.dropFirst(13)) : message
+                if attempt == 0 { try await Task.sleep(nanoseconds: 2_500_000_000) }
+            }
+        }
+        throw AIError.access(L(
+            "Claude Code could not sign in. \(last)\nSign in to Claude Code again, or use an Anthropic API key instead.",
+            "Claude Code konnte sich nicht anmelden. \(last)\nMelde dich bei Claude Code neu an oder verwende stattdessen einen Anthropic-API-Key."),
+            source: "cli")
+    }
+
+    /// Opens Terminal with `claude auth login`: a browser window opens for the Claude sign-in.
+    @MainActor
+    static func openSignIn() {
+        guard let exe = locate() else { return }
+        let quoted = "'" + exe.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let script = """
+        #!/bin/zsh -l
+        clear
+        echo 'Blanko: signing in to Claude Code. A browser window opens; finish the sign-in there.'
+        echo
+        \(quoted) auth login
+        echo
+        echo 'Done. Close this window and press "Try again" in Blanko.'
+
+        """
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("Blanko sign-in.command")
+        try? FileManager.default.removeItem(at: file)
+        guard (try? script.write(to: file, atomically: true, encoding: .utf8)) != nil else { return }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: file.path)
+        let terminal = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
+        NSWorkspace.shared.open([file], withApplicationAt: terminal, configuration: NSWorkspace.OpenConfiguration())
+    }
+
+    /// `claude auth status`: signed in, and until when. Nil when Claude Code does not answer.
+    static func authStatus() async -> (loggedIn: Bool, expires: Date?)? {
+        guard let exe = locate() else { return nil }
+        let env = await readyEnvironment()
+        return await withCheckedContinuation { cont in
+            DispatchQueue.global(qos: .utility).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: exe)
+                process.arguments = ["auth", "status", "--json"]
+                process.environment = env
+                process.currentDirectoryURL = FileManager.default.temporaryDirectory
+                process.standardInput = FileHandle.nullDevice
+                process.standardError = FileHandle.nullDevice
+                let out = Pipe()
+                process.standardOutput = out
+                guard (try? process.run()) != nil else { return cont.resume(returning: nil) }
+                let killer = DispatchWorkItem { if process.isRunning { process.terminate() } }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 15, execute: killer)
+                let data = out.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                killer.cancel()
+                guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                    return cont.resume(returning: nil)
+                }
+                let expires = (json["loginExpiresAt"] as? String).flatMap { s -> Date? in
+                    let f = ISO8601DateFormatter()
+                    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                    return f.date(from: s) ?? ISO8601DateFormatter().date(from: s)
+                }
+                cont.resume(returning: (json["loggedIn"] as? Bool ?? false, expires))
             }
         }
     }
 
     private func run(_ request: AIRequest, settingSources: String) async throws -> [String: Any] {
+        // An empty folder of its own as the working directory, so nothing of the Mac is in reach.
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("blanko-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        var prompt = ""
-        if !request.images.isEmpty {
-            var names: [String] = []
-            for (i, png) in request.images.enumerated() {
-                let name = "image-\(i + 1).png"
-                try png.write(to: dir.appendingPathComponent(name))
-                names.append(dir.appendingPathComponent(name).path)
-            }
-            prompt += "The images for this turn are files. Read each of them with the Read tool before you answer, in this order:\n"
-            prompt += names.joined(separator: "\n") + "\n\n"
+        // The images travel inside the message itself (stream-json input), so Claude Code needs no
+        // tool at all: a PDF that tells the model to read files has nothing to read them with.
+        var content: [[String: Any]] = request.images.map {
+            ["type": "image", "source": ["type": "base64", "media_type": "image/png", "data": $0.base64EncodedString()]]
         }
-        prompt += request.text
+        content.append(["type": "text", "text": request.text])
+        let message: [String: Any] = ["type": "user", "message": ["role": "user", "content": content]]
+        var input = try JSONSerialization.data(withJSONObject: message)
+        input.append(0x0A)
 
         let schema = String(data: try JSONSerialization.data(withJSONObject: request.schema), encoding: .utf8) ?? "{}"
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.currentDirectoryURL = dir
         process.arguments = [
-            "-p", "--output-format", "json", "--json-schema", schema,
+            "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+            "--json-schema", schema,
             "--model", request.model, "--effort", "high",
             "--system-prompt", request.system,
-            "--tools", "Read", "--setting-sources", settingSources, "--strict-mcp-config",
+            "--tools", "", "--setting-sources", settingSources, "--strict-mcp-config",
             "--no-session-persistence", "--disable-slash-commands",
         ]
         var env = await Self.readyEnvironment()
@@ -272,10 +389,18 @@ struct ClaudeCodeBackend: AIBackend {
                 DispatchQueue.global(qos: .userInitiated).async {
                     do {
                         try process.run()
-                        stdin.fileHandleForWriting.write(Data(prompt.utf8))
+                        // Read the error stream alongside, so a chatty one cannot fill its pipe and stall both sides.
+                        let errBox = DataBox()
+                        let errDone = DispatchSemaphore(value: 0)
+                        DispatchQueue.global(qos: .utility).async {
+                            errBox.data = stderr.fileHandleForReading.readDataToEndOfFile()
+                            errDone.signal()
+                        }
+                        stdin.fileHandleForWriting.write(input)
                         try? stdin.fileHandleForWriting.close()
                         let data = stdout.fileHandleForReading.readDataToEndOfFile()
-                        let err = stderr.fileHandleForReading.readDataToEndOfFile()
+                        errDone.wait()
+                        let err = errBox.data
                         process.waitUntilExit()
                         if data.isEmpty {
                             let text = String(data: err, encoding: .utf8) ?? ""
@@ -293,8 +418,14 @@ struct ClaudeCodeBackend: AIBackend {
         }
         try Task.checkCancellation()
 
-        guard let json = (try? JSONSerialization.jsonObject(with: output)) as? [String: Any] else {
-            throw AIError.failed("Claude Code: " + String((String(data: output, encoding: .utf8) ?? "").prefix(400)))
+        // One JSON object per line; the answer is the last line of type "result".
+        let lines = output.split(separator: 0x0A)
+        let result = lines.reversed().lazy
+            .compactMap { (try? JSONSerialization.jsonObject(with: Data($0))) as? [String: Any] }
+            .first { $0["type"] as? String == "result" }
+        guard let json = result else {
+            let last = lines.last.map { String(decoding: $0, as: UTF8.self) } ?? ""
+            throw AIError.failed("Claude Code: " + String(last.prefix(400)))
         }
         if json["is_error"] as? Bool == true {
             throw AIError.failed("Claude Code: " + String(((json["result"] as? String) ?? "error").prefix(400)))
@@ -306,6 +437,11 @@ struct ClaudeCodeBackend: AIBackend {
         }
         throw AIError.badOutput
     }
+}
+
+/// Bytes filled in on one thread and read on another after a semaphore.
+private final class DataBox: @unchecked Sendable {
+    var data = Data()
 }
 
 // MARK: - Keychain

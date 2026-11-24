@@ -17,7 +17,15 @@ enum UITest {
         Task { @MainActor in
             for step in steps {
                 try? await Task.sleep(nanoseconds: 350_000_000)
-                perform(step)
+                if step.hasPrefix("wait ") {          // wait <seconds>
+                    try? await Task.sleep(nanoseconds: UInt64((Double(step.dropFirst(5)) ?? 1) * 1_000_000_000))
+                } else if step == "idle" {             // until the assistant has finished (at most 10 minutes)
+                    for _ in 0..<1200 where AppState.shared.reader?.busy == true {
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                    }
+                } else {
+                    perform(step)
+                }
             }
         }
     }
@@ -73,8 +81,143 @@ enum UITest {
         case "ask": AppState.shared.reader?.send(rest)
         case "lang": Prefs.shared.lang = rest
         case "light": NSApp.appearance = NSAppearance(named: .aqua)
+        case "dark": NSApp.appearance = NSAppearance(named: .darkAqua)
+        case "resize": if nums.count >= 2 { window.setContentSize(NSSize(width: nums[0], height: nums[1])) }
+        case "shot": shot(window, to: URL(fileURLWithPath: rest))
+        case "keysheet": AppState.shared.reader?.showKeySheet = true
+        case "sheetshot": if let sheet = window.attachedSheet { shot(sheet, to: URL(fileURLWithPath: rest)) }
+        case "clear": AppState.shared.reader?.clearChat()
+        case "chattop":
+            // The chat's scroll view: every scroll view right of the PDF.
+            guard let canvas = AppState.shared.reader?.canvas, let root = window.contentView else { break }
+            let edge = canvas.convert(canvas.bounds, to: nil).maxX
+            func walk(_ v: NSView) {
+                if let s = v as? NSScrollView, s !== canvas.enclosingScrollView, s.convert(s.bounds, to: nil).minX >= edge - 1,
+                   let doc = s.documentView {
+                    let top = doc.isFlipped ? 0 : max(0, doc.bounds.height - s.contentView.bounds.height)
+                    s.contentView.scroll(to: NSPoint(x: 0, y: top - s.contentInsets.top))
+                    s.reflectScrolledClipView(s.contentView)
+                }
+                v.subviews.forEach(walk)
+            }
+            walk(root)
+        case "quit": AppState.shared.reader?.dirty = false; NSApp.terminate(nil)
         case "open": AppState.shared.open(URL(fileURLWithPath: rest))
         default: break
+        }
+    }
+
+    /// `shot <file.png>`: the whole window (title bar included) drawn at 2x, with rounded corners and
+    /// a soft shadow on a clear backdrop, the way the pictures on the download page look. The screen
+    /// of a headless Mac is 1x, so a screen capture would be blurry.
+    private static func shot(_ window: NSWindow, to url: URL) {
+        let scale: CGFloat = 2
+        guard let frame = window.contentView?.superview else { return }
+        let b = frame.bounds
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(b.width * scale), pixelsHigh: Int(b.height * scale),
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return }
+        rep.size = b.size
+        frame.cacheDisplay(in: b, to: rep)
+        // Two things a window snapshot leaves out are drawn in by hand: the PDF pages (PDFKit
+        // renders them in layers of its own) and the rows of the sidebar list.
+        if let g = NSGraphicsContext(bitmapImageRep: rep) {
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = g
+            window.effectiveAppearance.performAsCurrentDrawingAppearance {
+                drawPages(in: window, frame: frame, cg: g.cgContext)
+                drawSidebarLists(in: frame, cg: g.cgContext)
+            }
+            NSGraphicsContext.restoreGraphicsState()
+        }
+        let picture = NSImage(size: b.size)
+        picture.addRepresentation(rep)
+
+        let dark = window.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        let pad: CGFloat = 40, radius: CGFloat = 12
+        let size = NSSize(width: b.width + pad * 2, height: b.height + pad * 2)
+        guard let out = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size.width * scale), pixelsHigh: Int(size.height * scale),
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return }
+        out.size = size
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: out)
+        let rect = NSRect(x: pad, y: pad, width: b.width, height: b.height)
+        let shape = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowBlurRadius = 24
+        shadow.shadowOffset = NSSize(width: 0, height: -12)
+        shadow.shadowColor = NSColor.black.withAlphaComponent(dark ? 0.6 : 0.32)
+        shadow.set()
+        (dark ? NSColor(white: 0.2, alpha: 1) : NSColor.white).setFill()
+        shape.fill()
+        NSGraphicsContext.restoreGraphicsState()
+        NSGraphicsContext.saveGraphicsState()
+        shape.addClip()
+        picture.draw(in: rect)
+        NSGraphicsContext.restoreGraphicsState()
+        NSGraphicsContext.restoreGraphicsState()
+        try? out.representation(using: .png, properties: [:])?.write(to: url)
+        FileHandle.standardError.write(Data("shot \(url.path) \(Int(size.width * scale))x\(Int(size.height * scale))\n".utf8))
+    }
+
+    private static func drawPages(in window: NSWindow, frame: NSView, cg: CGContext) {
+        guard let canvas = AppState.shared.reader?.canvas, canvas.window === window else { return }
+        let area = canvas.convert(canvas.bounds, to: frame)
+        cg.saveGState()
+        cg.clip(to: area)
+        (canvas.backgroundColor).setFill()
+        area.fill()
+        for page in canvas.visiblePages {
+            let box = page.bounds(for: canvas.displayBox)
+            let r = frame.convert(canvas.convert(box, from: page), from: canvas)
+            cg.saveGState()
+            cg.setShadow(offset: CGSize(width: 0, height: -1), blur: 6, color: NSColor.black.withAlphaComponent(0.25).cgColor)
+            cg.setFillColor(CGColor.white)
+            cg.fill(r)
+            cg.restoreGState()
+            cg.saveGState()
+            cg.clip(to: r)
+            cg.translateBy(x: r.minX, y: r.minY)
+            cg.scaleBy(x: r.width / box.width, y: r.height / box.height)
+            cg.translateBy(x: -box.minX, y: -box.minY)
+            page.draw(with: canvas.displayBox, to: cg)
+            cg.restoreGState()
+        }
+        cg.restoreGState()
+    }
+
+    private static func drawSidebarLists(in frame: NSView, cg: CGContext) {
+        func find(_ v: NSView, _ out: inout [NSOutlineView]) {
+            if let o = v as? NSOutlineView { out.append(o) }
+            for s in v.subviews { find(s, &out) }
+        }
+        var lists: [NSOutlineView] = []
+        find(frame, &lists)
+        for list in lists {
+            let visible = list.visibleRect
+            let r = frame.convert(visible, from: list)
+            guard r.width > 20, r.height > 20,
+                  let sub = list.bitmapImageRepForCachingDisplay(in: visible) else { continue }
+            let hi = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(visible.width * 2), pixelsHigh: Int(visible.height * 2),
+                                      bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                      colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) ?? sub
+            hi.size = visible.size
+            // The selection is drawn with the window's vibrancy, which a snapshot turns black:
+            // leave it out of the snapshot and draw the inactive-window look underneath instead.
+            for row in list.selectedRowIndexes {
+                let rr = frame.convert(list.rect(ofRow: row).insetBy(dx: 10, dy: 0), from: list)
+                NSColor.labelColor.withAlphaComponent(0.09).setFill()
+                NSBezierPath(roundedRect: rr, xRadius: 6, yRadius: 6).fill()
+            }
+            let style = list.selectionHighlightStyle
+            list.selectionHighlightStyle = .none
+            list.cacheDisplay(in: visible, to: hi)
+            list.selectionHighlightStyle = style
+            let image = NSImage(size: visible.size)
+            image.addRepresentation(hi)
+            image.draw(in: r)
         }
     }
 }
